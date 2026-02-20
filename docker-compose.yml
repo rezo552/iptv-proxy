@@ -9,3 +9,8 @@ services:
       - ./:/app
     environment:
       - PYTHONUNBUFFERED=1
+      - XMLTV_URL=${XMLTV_URL}
+      - PROVIDER_URL=${PROVIDER_URL}
+      - JACKETT_HOST=${JACKETT_HOST}
+      - JACKETT_API_KEY=${JACKETT_API_KEY}
+      - PREFERRED_LANGUAGE=${PREFERRED_LANGUAGE}
