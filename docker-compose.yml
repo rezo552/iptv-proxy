@@ -5,8 +5,6 @@ services:
     container_name: iptv-proxy
     ports:
       - "8080:8080"
-    volumes:
-      - ./:/app
     environment:
       - PYTHONUNBUFFERED=1
       - XMLTV_URL=${XMLTV_URL}
