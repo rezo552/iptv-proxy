@@ -44,7 +44,7 @@ async def playlist_m3u(request):
         display_name = ch.find('display-name').text if ch.find('display-name') is not None else channel_id
         stream_url = str(request.url.with_path(f'/channel/{channel_id}').with_query(''))
         m3u.append(
-            f'#EXTINF:0 tvg-id="{channel_id}" channel-id="{channel_id}" channel-number="{channel_number}" tvg-name="{channel_id}", {channel_id}'
+            f'#EXTINF:0 tvg-id="{channel_id}" channel-id="{channel_id}" channel-number="{channel_number}" tvg-name="{channel_id}", {display_name}'
         )
         m3u.append(stream_url)
         channel_number += 1
