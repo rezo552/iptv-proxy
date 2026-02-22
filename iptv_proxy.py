@@ -82,7 +82,7 @@ async def fetch_xmltv_and_get_programme(channels, channel_id):
     except Exception as e:
         logging.error(f"XMLTV parse error: {e}")
         return web.Response(status=500, text='XMLTV parse error')
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     selected = None
     for programme in root.findall('programme'):
         start_str = programme.attrib.get('start')
@@ -224,7 +224,7 @@ async def stream_with_delay(request):
         logging.error(f"Channel {channel_id} not found in XMLTV.")
         return web.Response(status=404, text='Channel not found in XMLTV')
     # ...existing code for programme selection and streaming...
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     programmes = []
     for programme in root.findall('programme'):
         if programme.attrib.get('channel') != channel_id:
@@ -358,7 +358,7 @@ async def stream_with_delay(request):
                     break
                 await proc.wait()
                 logging.info(f"Finished sending black video/silence for gap.")
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
     await response.write_eof()
     logging.info(f"Streaming finished for channel {channel_id}")
     return response
