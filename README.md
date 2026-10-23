@@ -29,7 +29,7 @@ This project provides an IPTV proxy server that streams content with a delay, us
 
 3. Access the playlist:
    - `http://localhost:8080/playlist.m3u`
-   - Stream channels via `/channel/{channel_id}` (Matroska, add `?format=ts` for MPEG-TS)
+   - Stream channels via `/channel/{channel_id}` (Matroska) or `/channel/{channel_id}.ts` (MPEG-TS)
 
 4. Use it as an HDHomeRun tuner:
    - Plex: Live TV & DVR > Set up > enter the address manually, e.g. `192.168.1.10:8045`

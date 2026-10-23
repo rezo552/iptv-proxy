@@ -80,8 +80,9 @@ async def hdhr_discover(request):
     return web.json_response({
         'FriendlyName': HDHR_FRIENDLY_NAME,
         'Manufacturer': 'Silicondust',
-        'ModelNumber': 'HDTC-2US',
-        'FirmwareName': 'hdhomeruntc_atsc',
+        # A non-transcoding model, for HDTC ("Extend") models Plex requests ?transcode=...
+        'ModelNumber': 'HDHR5-4US',
+        'FirmwareName': 'hdhomerun5_atsc',
         'FirmwareVersion': '20200101',
         'DeviceID': HDHR_DEVICE_ID,
         'DeviceAuth': 'iptvproxy',
@@ -107,7 +108,7 @@ async def hdhr_lineup(request):
         {
             'GuideNumber': str(channel_number),
             'GuideName': display_name,
-            'URL': f'{base_url}/channel/{urllib.parse.quote(channel_id)}?format=ts',
+            'URL': f'{base_url}/channel/{urllib.parse.quote(channel_id)}.ts',
         }
         for channel_number, (channel_id, display_name) in enumerate(channels, start=1)
     ])
@@ -126,8 +127,8 @@ async def hdhr_device_xml(request):
     <deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType>
     <friendlyName>{escape(HDHR_FRIENDLY_NAME)}</friendlyName>
     <manufacturer>Silicondust</manufacturer>
-    <modelName>HDTC-2US</modelName>
-    <modelNumber>HDTC-2US</modelNumber>
+    <modelName>HDHR5-4US</modelName>
+    <modelNumber>HDHR5-4US</modelNumber>
     <serialNumber></serialNumber>
     <UDN>uuid:{HDHR_DEVICE_ID}</UDN>
   </device>
@@ -283,6 +284,12 @@ async def stop_ffmpeg(proc):
 
 async def stream_with_delay(request):
     channel_id = request.match_info['channel_id']
+    # /channel/{id}.ts (or ?format=ts) gives MPEG-TS, what HDHomeRun clients like Plex expect.
+    # The path form matters: Plex appends its own "?transcode=..." to tuner URLs, which
+    # turns "?format=ts" into "?format=ts?transcode=heavy".
+    mpegts = request.query.get('format', '').startswith('ts')
+    if channel_id.endswith('.ts'):
+        channel_id, mpegts = channel_id[:-3], True
     logging.info(f"Incoming stream request for channel ID: {channel_id}")
     # Fetch and parse XMLTV
     logging.info(f"Trying to fetch and parse XMLTV guide...")
@@ -349,8 +356,7 @@ async def stream_with_delay(request):
         elif start.astimezone(timezone.utc) > now_utc:
             idx = i
             break
-    # ?format=ts gives MPEG-TS (what HDHomeRun clients like Plex expect), default Matroska
-    if request.query.get('format') == 'ts':
+    if mpegts:
         container, content_type, extension = 'mpegts', 'video/mp2t', 'ts'
     else:
         container, content_type, extension = 'matroska', 'video/x-matroska', 'mkv'
@@ -467,7 +473,10 @@ async def stream_with_delay(request):
                 await proc.wait()
                 logging.info(f"Finished sending black video/silence for gap.")
         now = datetime.now(timezone.utc)
-    await response.write_eof()
+    try:
+        await response.write_eof()
+    except ConnectionResetError:
+        pass  # client already gone
     logging.info(f"Streaming finished for channel {channel_id}")
     return response
 
