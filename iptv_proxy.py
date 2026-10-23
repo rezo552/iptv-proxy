@@ -19,6 +19,8 @@ PROVIDER_URL = os.getenv("PROVIDER_URL")
 JACKETT_HOST = os.getenv("JACKETT_HOST")
 JACKETT_API_KEY = os.getenv("JACKETT_API_KEY")
 PREFERRED_LANGUAGE = os.getenv("PREFERRED_LANGUAGE", "hun")
+# Seconds sent faster than real time when a channel starts, so playback starts quickly
+INITIAL_BURST_SECONDS = int(os.getenv("INITIAL_BURST_SECONDS", "10"))
 
 # HDHomeRun tuner emulation (for Plex / Emby / Jellyfin)
 HDHR_FRIENDLY_NAME = os.getenv("HDHR_FRIENDLY_NAME", "IPTV Proxy")
@@ -282,6 +284,39 @@ async def stop_ffmpeg(proc):
     await proc.wait()
 
 
+# ffmpeg's mpegts muxer starts timestamps at this value (muxdelay + muxpreload)
+MPEGTS_START_SECONDS = 1.4
+
+
+class TsPtsTracker:
+    """Keeps the highest PTS (seconds) seen in an MPEG-TS byte stream from ffmpeg."""
+
+    def __init__(self):
+        self.buffer = b''
+        self.max_pts = None
+
+    def feed(self, data):
+        data = self.buffer + data
+        end = len(data) - len(data) % 188
+        for i in range(0, end, 188):
+            packet = data[i:i + 188]
+            # sync byte, payload_unit_start_indicator (a PES header starts here)
+            if packet[0] != 0x47 or not packet[1] & 0x40:
+                continue
+            adaptation = (packet[3] >> 4) & 3
+            if not adaptation & 1:  # no payload
+                continue
+            start = 4 + (1 + packet[4] if adaptation & 2 else 0)
+            pes = packet[start:]
+            if len(pes) < 14 or pes[:3] != b'\x00\x00\x01' or not pes[7] & 0x80:  # no PTS
+                continue
+            b = pes[9:14]
+            pts = (((b[0] >> 1) & 7) << 30 | b[1] << 22 | (b[2] >> 1) << 15 | b[3] << 7 | b[4] >> 1) / 90000
+            if self.max_pts is None or pts > self.max_pts:
+                self.max_pts = pts
+        self.buffer = data[end:]
+
+
 async def stream_with_delay(request):
     channel_id = request.match_info['channel_id']
     # /channel/{id}.ts (or ?format=ts) gives MPEG-TS, what HDHomeRun clients like Plex expect.
@@ -365,6 +400,61 @@ async def stream_with_delay(request):
         'Content-Disposition': f'inline; filename="channel_{channel_id}.{extension}"'
     })
     await response.prepare(request)
+    # Each programme and gap is a separate ffmpeg run ("segment"). Output is paced to real
+    # time like a broadcast, otherwise a mostly downloaded movie is pushed in seconds and
+    # the client reaches the next segment long before the guide says so.
+    segments = 0
+    ts_position = 0.0  # output time (s) where the next segment continues
+
+    def pacing_args():
+        # Only the first segment gets an initial burst, so the client can start quickly
+        burst = INITIAL_BURST_SECONDS if segments == 0 else 0
+        return ['-readrate', '1', '-readrate_initial_burst', str(burst)]
+
+    def ts_offset_args():
+        # MPEG-TS clients (Plex) end the session when timestamps jump back at a segment
+        # boundary, so continue them from where the previous segment ended
+        if not mpegts or segments == 0:
+            return []
+        return ['-output_ts_offset', f'{ts_position:.3f}']
+
+    async def start_segment(ffmpeg_cmd):
+        proc = await asyncio.create_subprocess_exec(
+            *ffmpeg_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        return proc, TsPtsTracker()
+
+    async def finish_segment(proc, tracker):
+        nonlocal ts_position, segments
+        await proc.wait()
+        # The next segment starts at its offset + MPEGTS_START_SECONDS; continue just after
+        # the last timestamp sent (a small forward jump is harmless, a backward one is not)
+        if tracker.max_pts is not None:
+            ts_position = tracker.max_pts - MPEGTS_START_SECONDS + 0.5
+        segments += 1
+
+    async def send(proc, tracker):
+        while True:
+            chunk = await proc.stdout.read(4096)
+            if not chunk:
+                break
+            if mpegts:
+                tracker.feed(chunk)
+            await response.write(chunk)
+
+    # MPEG-TS: same track layout in every segment (first video + first audio as AAC 5.1),
+    # Matroska keeps all audio tracks as before
+    if mpegts:
+        movie_map_args = ['-map', '0:V:0', '-map', '0:a:0', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '384k', '-ac', '6']
+        gap_audio = 'anullsrc=channel_layout=5.1:sample_rate=48000'
+        gap_audio_args = ['-c:a', 'aac', '-b:a', '384k', '-ac', '6']
+    else:
+        movie_map_args = ['-map', '0:v', '-map', '0:a', '-c', 'copy']
+        gap_audio = 'anullsrc=channel_layout=stereo:sample_rate=44100'
+        gap_audio_args = ['-c:a', 'aac']
+
     while idx < len(programmes):
         start, stop, programme = programmes[idx]
         now_utc = datetime.now(timezone.utc)
@@ -399,26 +489,18 @@ async def stream_with_delay(request):
             'ffmpeg',
             '-hide_banner',
             '-loglevel', 'error',
+            *pacing_args(),
             '-ss', str(offset),
             '-i', playable_url,
-            '-map', '0:v',
-            '-map', '0:a',
-            '-c', 'copy',
+            *movie_map_args,
+            *ts_offset_args(),
             '-f', container,
             'pipe:1'
         ]
         logging.info(f"FFmpeg command: {' '.join(ffmpeg_cmd)}")
-        proc = await asyncio.create_subprocess_exec(
-            *ffmpeg_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL
-        )
+        proc, tracker = await start_segment(ffmpeg_cmd)
         try:
-            while True:
-                chunk = await proc.stdout.read(4096)
-                if not chunk:
-                    break
-                await response.write(chunk)
+            await send(proc, tracker)
         except (asyncio.CancelledError, ConnectionResetError, BrokenPipeError):
             logging.warning(f"Client disconnected from channel {channel_id}")
             await stop_ffmpeg(proc)
@@ -426,13 +508,14 @@ async def stream_with_delay(request):
         except Exception:
             await stop_ffmpeg(proc)
             raise
-        await proc.wait()
+        await finish_segment(proc, tracker)
         logging.info(f"Finished streaming programme {idx+1}/{len(programmes)}")
         idx += 1
         # If there is a gap before the next programme, keep the connection open with black video/silence
         if idx < len(programmes):
             next_start, _, _ = programmes[idx]
-            gap = (next_start - now).total_seconds()
+            # Measured now, after the programme has played (was a timestamp from before it)
+            gap = (next_start - datetime.now(timezone.utc)).total_seconds()
             if gap > 0:
                 logging.info(f"Gap of {gap} seconds before next programme. Sending black video/silence.")
                 # Use ffmpeg to generate black video and silence for the gap duration
@@ -440,29 +523,25 @@ async def stream_with_delay(request):
                     'ffmpeg',
                     '-hide_banner',
                     '-loglevel', 'error',
+                    *pacing_args(),
                     '-f', 'lavfi',
                     '-i', f'color=size=1280x720:rate=25:duration={int(gap)}',
+                    *pacing_args(),
                     '-f', 'lavfi',
-                    '-i', f'anullsrc=channel_layout=stereo:sample_rate=44100',
+                    '-i', gap_audio,
                     '-shortest',
                     '-c:v', 'libx264',
                     '-preset', 'ultrafast',
-                    '-c:a', 'aac',
+                    '-pix_fmt', 'yuv420p',
+                    *gap_audio_args,
+                    *ts_offset_args(),
                     '-f', container,
                     'pipe:1'
                 ]
                 logging.info(f"FFmpeg black video command: {' '.join(ffmpeg_cmd)}")
-                proc = await asyncio.create_subprocess_exec(
-                    *ffmpeg_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL
-                )
+                proc, tracker = await start_segment(ffmpeg_cmd)
                 try:
-                    while True:
-                        chunk = await proc.stdout.read(4096)
-                        if not chunk:
-                            break
-                        await response.write(chunk)
+                    await send(proc, tracker)
                 except (asyncio.CancelledError, ConnectionResetError, BrokenPipeError):
                     logging.warning(f"Client disconnected from channel {channel_id} during gap.")
                     await stop_ffmpeg(proc)
@@ -470,9 +549,8 @@ async def stream_with_delay(request):
                 except Exception:
                     await stop_ffmpeg(proc)
                     raise
-                await proc.wait()
+                await finish_segment(proc, tracker)
                 logging.info(f"Finished sending black video/silence for gap.")
-        now = datetime.now(timezone.utc)
     try:
         await response.write_eof()
     except ConnectionResetError:
