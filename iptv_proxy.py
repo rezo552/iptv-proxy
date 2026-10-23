@@ -186,6 +186,18 @@ async def get_playable_url(provider_url, torrent_url):
     return None
 
 
+async def stop_ffmpeg(proc):
+    # Kill ffmpeg if it is still running. Without this a disconnected client leaves
+    # ffmpeg blocked on a full stdout pipe, holding its HTTP connection to the torrent
+    # streamer open forever (stream never closes, torrent never released).
+    if proc.returncode is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+    await proc.wait()
+
+
 async def stream_with_delay(request):
     channel_id = request.match_info['channel_id']
     logging.info(f"Incoming stream request for channel ID: {channel_id}")
@@ -305,7 +317,7 @@ async def stream_with_delay(request):
         proc = await asyncio.create_subprocess_exec(
             *ffmpeg_cmd,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.DEVNULL
         )
         try:
             while True:
@@ -315,7 +327,11 @@ async def stream_with_delay(request):
                 await response.write(chunk)
         except (asyncio.CancelledError, ConnectionResetError, BrokenPipeError):
             logging.warning(f"Client disconnected from channel {channel_id}")
+            await stop_ffmpeg(proc)
             break
+        except Exception:
+            await stop_ffmpeg(proc)
+            raise
         await proc.wait()
         logging.info(f"Finished streaming programme {idx+1}/{len(programmes)}")
         idx += 1
@@ -345,7 +361,7 @@ async def stream_with_delay(request):
                 proc = await asyncio.create_subprocess_exec(
                     *ffmpeg_cmd,
                     stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
+                    stderr=asyncio.subprocess.DEVNULL
                 )
                 try:
                     while True:
@@ -355,7 +371,11 @@ async def stream_with_delay(request):
                         await response.write(chunk)
                 except (asyncio.CancelledError, ConnectionResetError, BrokenPipeError):
                     logging.warning(f"Client disconnected from channel {channel_id} during gap.")
+                    await stop_ffmpeg(proc)
                     break
+                except Exception:
+                    await stop_ffmpeg(proc)
+                    raise
                 await proc.wait()
                 logging.info(f"Finished sending black video/silence for gap.")
         now = datetime.now(timezone.utc)
