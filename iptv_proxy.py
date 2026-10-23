@@ -8,6 +8,8 @@ import logging
 from datetime import datetime, timezone
 from dateutil import parser as dateutil_parser
 import os
+import hashlib
+from xml.sax.saxutils import escape
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -18,6 +20,14 @@ JACKETT_HOST = os.getenv("JACKETT_HOST")
 JACKETT_API_KEY = os.getenv("JACKETT_API_KEY")
 PREFERRED_LANGUAGE = os.getenv("PREFERRED_LANGUAGE", "hun")
 
+# HDHomeRun tuner emulation (for Plex / Emby / Jellyfin)
+HDHR_FRIENDLY_NAME = os.getenv("HDHR_FRIENDLY_NAME", "IPTV Proxy")
+HDHR_TUNER_COUNT = int(os.getenv("HDHR_TUNER_COUNT", "4"))
+# Stable 8 hex digit device id, Plex identifies the tuner by it
+HDHR_DEVICE_ID = os.getenv("HDHR_DEVICE_ID") or hashlib.md5(HDHR_FRIENDLY_NAME.encode()).hexdigest()[:8].upper()
+# Base URL advertised to clients, e.g. http://192.168.1.10:8045 (default: taken from the request)
+HDHR_BASE_URL = os.getenv("HDHR_BASE_URL", "").rstrip('/')
+
 # Setup logging to stdout for Docker
 logging.basicConfig(
     level=logging.DEBUG,
@@ -26,30 +36,103 @@ logging.basicConfig(
 )
 
 
-# M3U playlist endpoint
-async def playlist_m3u(request):
+async def fetch_channels():
+    """Return [(channel_id, display_name), ...] from the XMLTV guide, or None on error."""
     async with ClientSession() as session:
         async with session.get(XMLTV_URL) as resp:
             xml_data = await resp.text()
     try:
         root = ET.fromstring(xml_data)
     except Exception as e:
-        logging.error(f"XMLTV parse error in playlist endpoint: {e}")
-        return web.Response(status=500, text='XMLTV parse error')
-    xmltv_url = XMLTV_URL
-    m3u = [f'#EXTM3U url-tvg="{xmltv_url}" x-tvg-url="{xmltv_url}"']
-    channel_number = 1
+        logging.error(f"XMLTV parse error while reading channels: {e}")
+        return None
+    channels = []
     for ch in root.findall('channel'):
         channel_id = ch.attrib.get('id')
         display_name = ch.find('display-name').text if ch.find('display-name') is not None else channel_id
+        channels.append((channel_id, display_name))
+    return channels
+
+
+# M3U playlist endpoint
+async def playlist_m3u(request):
+    channels = await fetch_channels()
+    if channels is None:
+        return web.Response(status=500, text='XMLTV parse error')
+    xmltv_url = XMLTV_URL
+    m3u = [f'#EXTM3U url-tvg="{xmltv_url}" x-tvg-url="{xmltv_url}"']
+    for channel_number, (channel_id, display_name) in enumerate(channels, start=1):
         stream_url = str(request.url.with_path(f'/channel/{channel_id}').with_query(''))
         m3u.append(
             f'#EXTINF:0 tvg-id="{channel_id}" channel-id="{channel_id}" channel-number="{channel_number}" tvg-name="{channel_id}", {display_name}'
         )
         m3u.append(stream_url)
-        channel_number += 1
     m3u_content = '\n'.join(m3u)
     return web.Response(text=m3u_content, content_type='audio/x-mpegurl')
+
+
+# HDHomeRun emulation endpoints
+def hdhr_base_url(request):
+    return HDHR_BASE_URL or f"{request.scheme}://{request.host}"
+
+async def hdhr_discover(request):
+    base_url = hdhr_base_url(request)
+    return web.json_response({
+        'FriendlyName': HDHR_FRIENDLY_NAME,
+        'Manufacturer': 'Silicondust',
+        'ModelNumber': 'HDTC-2US',
+        'FirmwareName': 'hdhomeruntc_atsc',
+        'FirmwareVersion': '20200101',
+        'DeviceID': HDHR_DEVICE_ID,
+        'DeviceAuth': 'iptvproxy',
+        'TunerCount': HDHR_TUNER_COUNT,
+        'BaseURL': base_url,
+        'LineupURL': f'{base_url}/lineup.json',
+    })
+
+async def hdhr_lineup_status(request):
+    return web.json_response({
+        'ScanInProgress': 0,
+        'ScanPossible': 1,
+        'Source': 'Cable',
+        'SourceList': ['Cable'],
+    })
+
+async def hdhr_lineup(request):
+    channels = await fetch_channels()
+    if channels is None:
+        return web.Response(status=500, text='XMLTV parse error')
+    base_url = hdhr_base_url(request)
+    return web.json_response([
+        {
+            'GuideNumber': str(channel_number),
+            'GuideName': display_name,
+            'URL': f'{base_url}/channel/{urllib.parse.quote(channel_id)}?format=ts',
+        }
+        for channel_number, (channel_id, display_name) in enumerate(channels, start=1)
+    ])
+
+async def hdhr_lineup_post(request):
+    # Channel scan request, nothing to scan
+    return web.Response(status=200)
+
+async def hdhr_device_xml(request):
+    base_url = hdhr_base_url(request)
+    xml = f'''<?xml version="1.0" encoding="UTF-8"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0">
+  <specVersion><major>1</major><minor>0</minor></specVersion>
+  <URLBase>{escape(base_url)}</URLBase>
+  <device>
+    <deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType>
+    <friendlyName>{escape(HDHR_FRIENDLY_NAME)}</friendlyName>
+    <manufacturer>Silicondust</manufacturer>
+    <modelName>HDTC-2US</modelName>
+    <modelNumber>HDTC-2US</modelNumber>
+    <serialNumber></serialNumber>
+    <UDN>uuid:{HDHR_DEVICE_ID}</UDN>
+  </device>
+</root>'''
+    return web.Response(text=xml, content_type='application/xml')
 
 async def fetch_xmltv_and_get_programme(channels, channel_id):
     url = XMLTV_URL
@@ -266,9 +349,14 @@ async def stream_with_delay(request):
         elif start.astimezone(timezone.utc) > now_utc:
             idx = i
             break
+    # ?format=ts gives MPEG-TS (what HDHomeRun clients like Plex expect), default Matroska
+    if request.query.get('format') == 'ts':
+        container, content_type, extension = 'mpegts', 'video/mp2t', 'ts'
+    else:
+        container, content_type, extension = 'matroska', 'video/x-matroska', 'mkv'
     response = web.StreamResponse(status=200, headers={
-        'Content-Type': 'video/x-matroska',
-        'Content-Disposition': f'inline; filename="channel_{channel_id}.mkv"'
+        'Content-Type': content_type,
+        'Content-Disposition': f'inline; filename="channel_{channel_id}.{extension}"'
     })
     await response.prepare(request)
     while idx < len(programmes):
@@ -310,7 +398,7 @@ async def stream_with_delay(request):
             '-map', '0:v',
             '-map', '0:a',
             '-c', 'copy',
-            '-f', 'matroska',
+            '-f', container,
             'pipe:1'
         ]
         logging.info(f"FFmpeg command: {' '.join(ffmpeg_cmd)}")
@@ -354,7 +442,7 @@ async def stream_with_delay(request):
                     '-c:v', 'libx264',
                     '-preset', 'ultrafast',
                     '-c:a', 'aac',
-                    '-f', 'matroska',
+                    '-f', container,
                     'pipe:1'
                 ]
                 logging.info(f"FFmpeg black video command: {' '.join(ffmpeg_cmd)}")
@@ -387,6 +475,12 @@ async def stream_with_delay(request):
 app = web.Application()
 app.router.add_get('/channel/{channel_id}', stream_with_delay)
 app.router.add_get('/playlist.m3u', playlist_m3u)
+# HDHomeRun tuner emulation
+app.router.add_get('/discover.json', hdhr_discover)
+app.router.add_get('/lineup_status.json', hdhr_lineup_status)
+app.router.add_get('/lineup.json', hdhr_lineup)
+app.router.add_route('*', '/lineup.post', hdhr_lineup_post)
+app.router.add_get('/device.xml', hdhr_device_xml)
 
 if __name__ == '__main__':
     web.run_app(app, port=8080)
